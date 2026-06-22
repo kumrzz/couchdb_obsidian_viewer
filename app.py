@@ -7,6 +7,7 @@ import re
 import shutil
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote, unquote
 
 import hashlib
@@ -19,7 +20,9 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import bleach
 import markdown
 import requests
+from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
+from urllib3.util.retry import Retry
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 from dotenv import load_dotenv
@@ -44,6 +47,19 @@ if _ssl_env.lower() in ("0", "false", "no"):
 else:
     # Treat any other non-empty value as a CA bundle path; "true" means default verification
     SSL_VERIFY = True if _ssl_env.lower() in ("1", "true", "yes") else _ssl_env
+
+# HTTP session with automatic retries on transient connection errors
+_RETRY = Retry(
+    total=4,
+    backoff_factor=0.5,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=("GET", "POST"),
+    raise_on_status=False,
+)
+_ADAPTER = HTTPAdapter(max_retries=_RETRY)
+_SESSION = requests.Session()
+_SESSION.mount("http://", _ADAPTER)
+_SESSION.mount("https://", _ADAPTER)
 
 WIKI_LINK_PATTERN = re.compile(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
 TAG_PATTERN = re.compile(r"(?<![\w/])#([A-Za-z][\w/-]*)")
@@ -131,14 +147,14 @@ BASE_TEMPLATE = """
 
 def couch_get(path: str):
     url = f"{COUCHDB_URL}/{COUCHDB_DB}/{path.lstrip('/')}"
-    response = requests.get(url, auth=AUTH, timeout=12, verify=SSL_VERIFY)
+    response = _SESSION.get(url, auth=AUTH, timeout=12, verify=SSL_VERIFY)
     return response
 
 
 def fetch_doc(doc_id: str) -> dict:
     # Request inline attachments so we can read LiveSync content stored as _attachments
     url = f"{COUCHDB_URL}/{COUCHDB_DB}/{doc_id.lstrip('/')}?attachments=true"
-    response = requests.get(url, auth=AUTH, timeout=12, verify=SSL_VERIFY)
+    response = _SESSION.get(url, auth=AUTH, timeout=12, verify=SSL_VERIFY)
     if response.status_code == 404:
         abort(404, description=f"Document '{doc_id}' not found")
     if not response.ok:
@@ -168,7 +184,7 @@ LOCAL_CACHE_NOTES_DIR = os.path.join(LOCAL_CACHE_DIR, "notes")
 _CACHE_READY = False
 _CACHED_NOTES: dict[str, dict] = {}
 _REBUILD_CACHE = False
-_BLOCKED_CACHE_PREFIXES = ("h%3A%2B",)
+_BLOCKED_CACHE_PREFIX = "h%3A%2B" # found to be spurious records(?)
 TAG_EXCLUSIONS_CONFIG = os.getenv("TAG_EXCLUSIONS_CONFIG", "./tag_exclusions.conf")
 
 
@@ -202,7 +218,7 @@ def _parse_pbkdf2_salt(value: str) -> bytes:
 
 def _fetch_sync_params_doc() -> dict:
     url = f"{COUCHDB_URL}/{COUCHDB_DB}/{_SYNC_PARAMS_DOC_ID}"
-    response = requests.get(url, auth=AUTH, timeout=12, verify=SSL_VERIFY)
+    response = _SESSION.get(url, auth=AUTH, timeout=12, verify=SSL_VERIFY)
     if not response.ok:
         return {}
     payload = response.json()
@@ -351,7 +367,7 @@ def fetch_chunks(chunk_ids: list) -> str:
     """Fetch LiveSync chunk documents in bulk and return joined content."""
     if not chunk_ids:
         return ""
-    response = requests.post(
+    response = _SESSION.post(
         f"{COUCHDB_URL}/{COUCHDB_DB}/_bulk_get",
         json={"docs": [{"id": cid} for cid in chunk_ids]},
         auth=AUTH,
@@ -652,23 +668,6 @@ def _cache_filename(doc_id: str) -> str:
     return re.sub(r"(?i)(\.md)+$", "", encoded)
 
 
-def _is_blocked_cache_doc_id(doc_id: str) -> bool:
-    encoded = quote(doc_id, safe="")
-    return any(encoded.startswith(prefix) for prefix in _BLOCKED_CACHE_PREFIXES)
-
-
-def _blocked_id_regex() -> str:
-    """Build a CouchDB _id regex from blocked URL-encoded prefixes."""
-    parts = []
-    for prefix in _BLOCKED_CACHE_PREFIXES:
-        if not prefix:
-            continue
-        parts.append(re.escape(unquote(prefix)))
-    if not parts:
-        return ""
-    return r"^(?:" + "|".join(parts) + r")"
-
-
 def _load_cache_index() -> None:
     global _CACHED_NOTES
     if not os.path.exists(LOCAL_CACHE_INDEX):
@@ -691,7 +690,7 @@ def _load_cache_index() -> None:
             doc_id = str(item.get("id", "")).strip()
             if not doc_id:
                 continue
-            if _is_blocked_cache_doc_id(doc_id):
+            if quote(doc_id, safe="").startswith(_BLOCKED_CACHE_PREFIX):
                 continue
 
             dedupe_key = _canonical_note_key(doc_id)
@@ -757,7 +756,7 @@ def _clear_local_cache() -> None:
 def _get_total_docs_count() -> int:
     """Best-effort total row count for CLI progress display."""
     try:
-        response = requests.get(
+        response = _SESSION.get(
             f"{COUCHDB_URL}/{COUCHDB_DB}/_all_docs?limit=0",
             auth=AUTH,
             timeout=12,
@@ -789,6 +788,42 @@ def _print_cache_progress(scanned: int, total: int, cached: int, elapsed: float 
     sys.stdout.flush()
 
 
+def _process_cache_doc(d: dict) -> dict | None:
+    """Process a single CouchDB document for caching. Safe to call from a thread."""
+    doc_id = str(d.get("_id", "")).strip()
+    if not doc_id:
+        return None
+    if d.get("deleted"):
+        return None
+    if quote(doc_id, safe="").startswith(_BLOCKED_CACHE_PREFIX):
+        return None
+    md_text = extract_markdown(d)
+    if not isinstance(md_text, str) or not md_text.strip():
+        return None
+    title = str(d.get("title") or d.get("name") or doc_id)
+    tags = extract_all_tags(d)
+    tags.update(TAG_PATTERN.findall(md_text))
+    return {
+        "id": doc_id,
+        "title": title,
+        "mtime": d.get("mtime"),
+        "ctime": d.get("ctime"),
+        "tags": set(tags),
+        "md_text": md_text,
+    }
+
+
+def _write_cache_file(doc_id: str, md_text: str, filename: str) -> bool:
+    """Write a single note's markdown to disk. Safe to call from a thread."""
+    file_path = os.path.join(LOCAL_CACHE_NOTES_DIR, filename)
+    try:
+        with open(file_path, "w", encoding="utf-8") as fh:
+            fh.write(md_text)
+        return True
+    except Exception:
+        return False
+
+
 def build_markdown_cache() -> tuple[int, int]:
     """Fetch markdown notes once from CouchDB and write cache files + index."""
     global _CACHED_NOTES
@@ -815,7 +850,7 @@ def build_markdown_cache() -> tuple[int, int]:
         if bookmark:
             payload["bookmark"] = bookmark
 
-        response = requests.post(
+        response = _SESSION.post(
             f"{COUCHDB_URL}/{COUCHDB_DB}/_find",
             json=payload,
             auth=AUTH,
@@ -829,47 +864,29 @@ def build_markdown_cache() -> tuple[int, int]:
         docs = body.get("docs", [])
         scanned += len(docs)
 
-        for d in docs:
-            doc_id = str(d.get("_id", "")).strip()
-            if not doc_id:
-                continue
-            if d.get("deleted"):
-                continue
-            if _is_blocked_cache_doc_id(doc_id):
-                continue
-
-            md_text = extract_markdown(d)
-            if not isinstance(md_text, str) or not md_text.strip():
-                continue
-
-            title = str(d.get("title") or d.get("name") or doc_id)
-            tags = extract_all_tags(d)
-            tags.update(TAG_PATTERN.findall(md_text))
-
-            dedupe_key = _canonical_note_key(doc_id)
-            current = {
-                "id": doc_id,
-                "title": title,
-                "mtime": d.get("mtime"),
-                "ctime": d.get("ctime"),
-                "tags": set(tags),
-                "md_text": md_text,
-            }
-            existing = selected_notes.get(dedupe_key)
-            if not existing:
-                selected_notes[dedupe_key] = current
-            else:
-                existing_id = str(existing.get("id", ""))
-                winner = sorted([existing_id, doc_id], key=_doc_id_priority, reverse=True)[0]
-                if winner == doc_id:
-                    current_tags = current.get("tags", set())
-                    if isinstance(current_tags, set):
-                        current_tags.update(existing.get("tags", set()))
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            futures = {executor.submit(_process_cache_doc, d): d for d in docs}
+            for future in as_completed(futures):
+                current = future.result()
+                if current is None:
+                    continue
+                doc_id = current["id"]
+                dedupe_key = _canonical_note_key(doc_id)
+                existing = selected_notes.get(dedupe_key)
+                if not existing:
                     selected_notes[dedupe_key] = current
                 else:
-                    existing_tags = existing.get("tags", set())
-                    if isinstance(existing_tags, set):
-                        existing_tags.update(tags)
+                    existing_id = str(existing.get("id", ""))
+                    winner = sorted([existing_id, doc_id], key=_doc_id_priority, reverse=True)[0]
+                    if winner == doc_id:
+                        current_tags = current.get("tags", set())
+                        if isinstance(current_tags, set):
+                            current_tags.update(existing.get("tags", set()))
+                        selected_notes[dedupe_key] = current
+                    else:
+                        existing_tags = existing.get("tags", set())
+                        if isinstance(existing_tags, set):
+                            existing_tags.update(current.get("tags", set()))
 
         _print_cache_progress(scanned=scanned, total=total_docs, cached=len(selected_notes), elapsed=time.monotonic() - _start_time)
 
@@ -878,26 +895,35 @@ def build_markdown_cache() -> tuple[int, int]:
             break
         bookmark = new_bookmark
 
-    records: list[dict] = []
+    # Build the list of pending writes
+    pending: list[tuple[str, str, str, dict]] = []
     for dedupe_key in sorted(selected_notes.keys()):
         note = selected_notes[dedupe_key]
         doc_id = str(note.get("id", "")).strip()
         md_text = str(note.get("md_text", ""))
         if not doc_id or not md_text.strip():
             continue
-
         filename = _cache_filename(doc_id)
-        file_path = os.path.join(LOCAL_CACHE_NOTES_DIR, filename)
-        try:
-            with open(file_path, "w", encoding="utf-8") as fh:
-                fh.write(md_text)
-        except Exception:
-            continue
+        pending.append((doc_id, md_text, filename, note))
 
+    # Write all files in parallel
+    written: set[str] = set()
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        write_futures = {
+            executor.submit(_write_cache_file, doc_id, md_text, filename): doc_id
+            for doc_id, md_text, filename, _ in pending
+        }
+        for future in as_completed(write_futures):
+            if future.result():
+                written.add(write_futures[future])
+
+    records: list[dict] = []
+    for doc_id, md_text, filename, note in pending:
+        if doc_id not in written:
+            continue
         tags_val = note.get("tags", set())
         if not isinstance(tags_val, set):
             tags_val = set()
-
         records.append(
             {
                 "id": doc_id,
