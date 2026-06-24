@@ -1,6 +1,7 @@
-import base64
 import argparse
+import base64
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -9,8 +10,6 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote, unquote
-
-import hashlib
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -119,6 +118,10 @@ BASE_TEMPLATE = """
       }
             .topnav {
                 margin-bottom: 1rem;
+                display: flex;
+                align-items: center;
+                gap: 0.8rem;
+                flex-wrap: wrap;
             }
             .bottomnav {
                 margin-top: 1.25rem;
@@ -126,6 +129,28 @@ BASE_TEMPLATE = """
             .topnav a,
             .bottomnav a {
                 margin-right: 0.8rem;
+            }
+            .topnav form {
+                margin: 0;
+                display: inline-flex;
+                align-items: center;
+                gap: 0.4rem;
+            }
+            .topnav input[type="search"] {
+                padding: 0.3rem 0.45rem;
+                border: 1px solid #d2c7b8;
+                border-radius: 6px;
+                min-width: 220px;
+                font: inherit;
+            }
+            .topnav button {
+                padding: 0.3rem 0.6rem;
+                border-radius: 6px;
+                border: 1px solid #0f766e;
+                background: #0f766e;
+                color: #fff;
+                font: inherit;
+                cursor: pointer;
             }
       .error {
         color: #991b1b;
@@ -135,7 +160,13 @@ BASE_TEMPLATE = """
   <body>
     <main class=\"wrap\">
       <section class=\"card\">
-                <div class="topnav"><a href="/">Home</a><a href="/all_files">All Files</a></div>
+                <div class="topnav">
+                    <a href="/">Home</a><a href="/all_files">All Files</a>
+                    <form method="get" action="/search">
+                        <input type="search" name="q" placeholder="Search notes" value="{{ request.args.get('q', '') | e }}" />
+                        <button type="submit">Search</button>
+                    </form>
+                </div>
         {{ body | safe }}
                 <div class="bottomnav"><a href="/">Home</a><a href="/all_files">All Files</a></div>
       </section>
@@ -183,8 +214,9 @@ LOCAL_CACHE_INDEX = os.path.join(LOCAL_CACHE_DIR, "index.json")
 LOCAL_CACHE_NOTES_DIR = os.path.join(LOCAL_CACHE_DIR, "notes")
 _CACHE_READY = False
 _CACHED_NOTES: dict[str, dict] = {}
+_BACKLINK_INDEX: dict[str, list[tuple[str, str]]] = {}  # Maps doc_id -> [(source_id, source_title), ...]
 _REBUILD_CACHE = False
-_BLOCKED_CACHE_PREFIX = "h%3A%2B" # found to be spurious records(?)
+_BLOCKED_CACHE_PREFIX = os.getenv("BLOCKED_CACHE_PREFIX", "h%3A%2B")  # URL-encoded prefix of spurious doc IDs to ignore
 TAG_EXCLUSIONS_CONFIG = os.getenv("TAG_EXCLUSIONS_CONFIG", "./tag_exclusions.conf")
 
 
@@ -446,20 +478,19 @@ def extract_markdown(doc: dict) -> str:
     return best_val
 
 
-def heading_to_anchor(heading: str) -> str:
-        normalized = heading.strip().lower()
-        normalized = normalized.replace("_", " ")
-        normalized = re.sub(r"[^\w\s-]", "", normalized)
-        normalized = re.sub(r"\s+", "-", normalized)
-        normalized = re.sub(r"-+", "-", normalized).strip("-")
-        return normalized or "section"
+def heading_to_anchor(heading: str, sep: str = "-") -> str:
+    normalized = heading.strip().lower().replace("_", " ")
+    normalized = re.sub(r"[^\w\s-]", "", normalized)
+    normalized = re.sub(r"\s+", sep, normalized)
+    normalized = re.sub(re.escape(sep) + "+", sep, normalized).strip(sep)
+    return normalized or "section"
 
 
 def split_wikilink_target(target: str) -> tuple[str, str | None]:
-        if "#" in target:
-                note_part, heading_part = target.split("#", 1)
-                return note_part.strip(), heading_part.strip() or None
-        return target.strip(), None
+    if "#" in target:
+        note_part, heading_part = target.split("#", 1)
+        return note_part.strip(), heading_part.strip() or None
+    return target.strip(), None
 
 
 def convert_wikilinks(text: str) -> str:
@@ -708,34 +739,52 @@ def _load_cache_index() -> None:
     
     # Filter out deleted notes by checking CouchDB
     _CACHED_NOTES = _filter_deleted_notes(notes)
+    # Rebuild reverse index for fast backlink lookups
+    _rebuild_backlink_index()
 
 
 def _filter_deleted_notes(notes: dict[str, dict]) -> dict[str, dict]:
-    if not notes:
+    """Remove notes whose cached markdown file no longer exists and persist the cleaned index."""
+    orphaned = {
+        doc_id for doc_id, note in notes.items()
+        if not note.get("file") or not os.path.exists(os.path.join(LOCAL_CACHE_NOTES_DIR, note["file"]))
+    }
+    if not orphaned:
         return notes
-    
-    # remove notes whose markdown files don't exist
-    orphaned_ids: set[str] = set()
-    for doc_id, note in notes.items():
-        file_path = os.path.join(LOCAL_CACHE_NOTES_DIR, note.get("file", ""))
-        if not os.path.exists(file_path):
-            orphaned_ids.add(doc_id)
-    
-    all_removed = orphaned_ids
-    if all_removed:
-        # Re-save index without deleted notes
-        remaining = {doc_id: note for doc_id, note in notes.items() if doc_id not in all_removed}
-        try:
-            records = list(remaining.values())
-            with open(LOCAL_CACHE_INDEX, "w", encoding="utf-8") as fh:
-                json.dump(records, fh, ensure_ascii=True, indent=2)
-        except Exception:
-            pass
-        return remaining
-    
-    return notes
+    remaining = {k: v for k, v in notes.items() if k not in orphaned}
+    try:
+        with open(LOCAL_CACHE_INDEX, "w", encoding="utf-8") as fh:
+            json.dump(list(remaining.values()), fh, ensure_ascii=True, indent=2)
+    except Exception:
+        pass
+    return remaining
 
 
+
+
+def _rebuild_backlink_index() -> None:
+    """Build reverse wikilink index: target_doc_id -> [(source_id, source_title)].
+
+    Uses a pre-built key→doc_id map for O(n) resolution instead of O(n²).
+    """
+    global _BACKLINK_INDEX
+    _BACKLINK_INDEX = {}
+
+    # Pre-build normalized-key → doc_id map for fast target resolution
+    key_to_id: dict[str, str] = {}
+    for doc_id in _CACHED_NOTES:
+        for key in (_normalize_note_key(doc_id), _normalize_note_key(os.path.basename(doc_id))):
+            if key:
+                key_to_id.setdefault(key, doc_id)
+
+    for source_id, note in _CACHED_NOTES.items():
+        source_title = str(note.get("title") or source_id)
+        for target_key in (note.get("wikilink_targets") or []):
+            target_id = key_to_id.get(target_key)
+            if target_id and target_id != source_id:
+                entries = _BACKLINK_INDEX.setdefault(target_id, [])
+                if (source_id, source_title) not in entries:
+                    entries.append((source_id, source_title))
 
 
 def _clear_local_cache() -> None:
@@ -793,7 +842,7 @@ def _process_cache_doc(d: dict) -> dict | None:
     doc_id = str(d.get("_id", "")).strip()
     if not doc_id:
         return None
-    if d.get("deleted"):
+    if d.get("_deleted") or d.get("deleted"):
         return None
     if quote(doc_id, safe="").startswith(_BLOCKED_CACHE_PREFIX):
         return None
@@ -803,6 +852,8 @@ def _process_cache_doc(d: dict) -> dict | None:
     title = str(d.get("title") or d.get("name") or doc_id)
     tags = extract_all_tags(d)
     tags.update(TAG_PATTERN.findall(md_text))
+    # Pre-compute normalized wikilink targets for fast backlink lookup at render time
+    wikilink_targets = _wikilink_targets(md_text)
     return {
         "id": doc_id,
         "title": title,
@@ -810,6 +861,7 @@ def _process_cache_doc(d: dict) -> dict | None:
         "ctime": d.get("ctime"),
         "tags": set(tags),
         "md_text": md_text,
+        "wikilink_targets": wikilink_targets,
     }
 
 
@@ -924,6 +976,9 @@ def build_markdown_cache() -> tuple[int, int]:
         tags_val = note.get("tags", set())
         if not isinstance(tags_val, set):
             tags_val = set()
+        wikilink_targets = note.get("wikilink_targets", set())
+        if not isinstance(wikilink_targets, set):
+            wikilink_targets = set()
         records.append(
             {
                 "id": doc_id,
@@ -932,6 +987,7 @@ def build_markdown_cache() -> tuple[int, int]:
                 "ctime": note.get("ctime"),
                 "tags": sorted(tags_val, key=lambda t: t.lower()),
                 "file": filename,
+                "wikilink_targets": sorted(wikilink_targets),
             }
         )
 
@@ -1011,23 +1067,6 @@ def _resolve_doc_id(doc_id: str) -> str:
     return sorted(set(candidates), key=_doc_id_priority, reverse=True)[0]
 
 
-def _note_match_keys(doc_id: str, title: str) -> set[str]:
-    keys: set[str] = set()
-    candidates = [
-        doc_id,
-        title,
-        os.path.basename(doc_id),
-        os.path.basename(title),
-    ]
-    for candidate in candidates:
-        if not candidate:
-            continue
-        key = _normalize_note_key(candidate)
-        if key:
-            keys.add(key)
-    return keys
-
-
 def _wikilink_targets(md_text: str) -> set[str]:
     targets: set[str] = set()
     for match in WIKI_LINK_PATTERN.finditer(md_text):
@@ -1042,37 +1081,10 @@ def _wikilink_targets(md_text: str) -> set[str]:
     return targets
 
 
-def _find_backlinks(doc_id: str, title: str) -> list[tuple[str, str]]:
-    resolved_target_id = _resolve_doc_id(doc_id)
-    target_keys = _note_match_keys(resolved_target_id, title)
-    if not target_keys:
-        return []
-
-    links: list[tuple[str, str]] = []
-    seen_source_ids: set[str] = set()
-    docs = sorted(_CACHED_NOTES.values(), key=lambda d: str(d.get("id", "")).lower())
-    for d in docs:
-        source_id = str(d.get("id", "")).strip()
-        if not source_id:
-            continue
-
-        resolved_source_id = _resolve_doc_id(source_id)
-        if not resolved_source_id or resolved_source_id == resolved_target_id:
-            continue
-        if resolved_source_id in seen_source_ids:
-            continue
-
-        source_md = _read_cached_markdown(source_id)
-        if not source_md:
-            continue
-
-        if target_keys.intersection(_wikilink_targets(source_md)):
-            resolved_note = _CACHED_NOTES.get(resolved_source_id, d)
-            source_title = str(resolved_note.get("title") or resolved_source_id)
-            links.append((resolved_source_id, source_title))
-            seen_source_ids.add(resolved_source_id)
-
-    return links
+def _find_backlinks(doc_id: str) -> list[tuple[str, str]]:
+    """Return pre-computed backlinks for a document. O(1) index lookup."""
+    resolved = _resolve_doc_id(doc_id)
+    return _BACKLINK_INDEX.get(resolved, []) if resolved else []
 
 
 @app.route("/")
@@ -1167,6 +1179,64 @@ def all_files():
     return page("All Files", body)
 
 
+@app.route("/search")
+def search_notes():
+    ensure_cache_loaded()
+
+    query = request.args.get("q", "").strip()
+    if not query:
+        body = (
+            "<h1>Search</h1>"
+            "<p class='meta'>Enter a term in the search box to find notes by title or content.</p>"
+        )
+        return page("Search", body)
+
+    needle = query.casefold()
+    matches: list[tuple[str, str]] = []
+
+    docs = sorted(
+        _CACHED_NOTES.values(),
+        key=lambda d: (-_note_last_modified_value(d), str(d.get("id", "")).lower()),
+    )
+    seen_doc_ids: set[str] = set()
+    for d in docs:
+        doc_id = str(d.get("id", "")).strip()
+        if not doc_id:
+            continue
+
+        resolved_id = _resolve_doc_id(doc_id)
+        if not resolved_id or resolved_id in seen_doc_ids:
+            continue
+
+        resolved_note = _CACHED_NOTES.get(resolved_id, d)
+        title = str(resolved_note.get("title") or resolved_id)
+        md_text = _read_cached_markdown(resolved_id)
+
+        searchable = f"{title}\n{resolved_id}\n{md_text}".casefold()
+        if needle in searchable:
+            matches.append((resolved_id, title))
+            seen_doc_ids.add(resolved_id)
+
+    if not matches:
+        body = (
+            f"<h1>Search: {bleach.clean(query)}</h1>"
+            "<p class='meta'>No matching notes found.</p>"
+        )
+        return page("Search", body)
+
+    items = []
+    for doc_id, title in matches:
+        href = f"/note/{quote(doc_id, safe='')}"
+        items.append(f"<li><a href='{href}'>{bleach.clean(title)}</a></li>")
+
+    body = (
+        f"<h1>Search: {bleach.clean(query)}</h1>"
+        f"<p class='meta'>{len(matches)} matches</p>"
+        f"<ul>{''.join(items)}</ul>"
+    )
+    return page("Search", body)
+
+
 @app.route("/note/<path:doc_id>")
 def note(doc_id: str):
     ensure_cache_loaded()
@@ -1178,7 +1248,7 @@ def note(doc_id: str):
     note_info = _CACHED_NOTES.get(resolved_doc_id, {})
     title = str(note_info.get("title") or resolved_doc_id)
     content_html = markdown_to_safe_html(md_text)
-    backlinks = _find_backlinks(resolved_doc_id, title)
+    backlinks = _find_backlinks(resolved_doc_id)
     if backlinks:
         backlink_items = []
         for src_id, src_title in backlinks:
